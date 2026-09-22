@@ -1,8 +1,13 @@
-from fastapi import FastAPI
+"""Compatibility entrypoint: delegates to the application factory.
 
-app = FastAPI()
+Run with: ``uv run fastapi run main.py`` or ``uv run uvicorn main:app``.
+"""
+from app.main import app
+
+__all__ = ["app"]
 
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
