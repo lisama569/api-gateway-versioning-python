@@ -43,16 +43,22 @@ def error_body(code: ErrorCode, message: str, request_id: str) -> dict:
     }
 
 
-def _respond(status_code: int, code: ErrorCode, message: str) -> JSONResponse:
+def _respond(
+    status_code: int,
+    code: ErrorCode,
+    message: str,
+    details: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     request_id = get_request_id()
     logger.info(
         "request_id=%s mapped_error code=%s status=%s message=%s",
         request_id, code.value, status_code, message,
     )
-    return JSONResponse(
-        status_code=status_code,
-        content=error_body(code, message, request_id),
-    )
+    body = error_body(code, message, request_id)
+    if details is not None:
+        body["error"]["details"] = details
+    return JSONResponse(status_code=status_code, content=body, headers=headers)
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -69,7 +75,24 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(RateLimitExceeded)
     async def _rate_limited(request: Request, exc: RateLimitExceeded):
         d = exc.decision
-        return _respond(429, ErrorCode.RATE_LIMITED, f"调用方 {d.caller} 超出限流额度")
+        details = {
+            "caller": d.caller,
+            "version": d.version,
+            "limit": d.limit,
+            "used": d.used,
+            "remaining": d.remaining,
+            # 与当前窗口一致的恢复时刻：窗口结束才恢复，而不是"下下次窗口"。
+            "window_seconds": d.window_seconds,
+            "reset_after_seconds": round(d.retry_after, 3),
+        }
+        return _respond(
+            429,
+            ErrorCode.RATE_LIMITED,
+            f"调用方 {d.caller} 在版本 {d.version} 上超出配额 "
+            f"({d.used}/{d.limit})，请 {d.retry_after_header} 秒后重试",
+            details=details,
+            headers={"Retry-After": d.retry_after_header},
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _validation(request: Request, exc: RequestValidationError):
