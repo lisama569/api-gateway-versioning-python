@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.middleware import get_request_id
+from app.quotas import QuotaExceeded, UnknownVersionPolicyError
 from app.ratelimit import RateLimitExceeded
 from app.versioning import DisabledVersionError, UnknownVersionError
 
@@ -33,25 +35,38 @@ class DependencyFailure(Exception):
     """底层依赖调用失败。"""
 
 
-def error_body(code: ErrorCode, message: str, request_id: str) -> dict:
-    return {
-        "error": {
-            "code": code.value,
-            "message": message,
-            "request_id": request_id,
-        }
+def error_body(
+    code: ErrorCode,
+    message: str,
+    request_id: str,
+    details: dict | None = None,
+) -> dict:
+    error = {
+        "code": code.value,
+        "message": message,
+        "request_id": request_id,
     }
+    if details:
+        error["details"] = details
+    return {"error": error}
 
 
-def _respond(status_code: int, code: ErrorCode, message: str) -> JSONResponse:
+def _respond(
+    status_code: int,
+    code: ErrorCode,
+    message: str,
+    details: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     request_id = get_request_id()
     logger.info(
-        "request_id=%s mapped_error code=%s status=%s message=%s",
-        request_id, code.value, status_code, message,
+        "request_id=%s mapped_error code=%s status=%s message=%s details=%s",
+        request_id, code.value, status_code, message, details,
     )
     return JSONResponse(
         status_code=status_code,
-        content=error_body(code, message, request_id),
+        content=error_body(code, message, request_id, details),
+        headers=headers,
     )
 
 
@@ -65,6 +80,37 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(DisabledVersionError)
     async def _disabled_version(request: Request, exc: DisabledVersionError):
         return _respond(410, ErrorCode.VERSION_DISABLED, f"接口版本已停用: {exc.requested}")
+
+    @app.exception_handler(QuotaExceeded)
+    async def _quota_exceeded(request: Request, exc: QuotaExceeded):
+        d = exc.decision
+        # 恢复时间必须对应当前生效窗口的重置时刻，而不是下一次窗口开始时间：
+        # 判定时刻已处于窗口内，reset_at = window_start + window；
+        # retry_after 由判定时刻算出并随决策返回，运行中改窗口也不会误导调用方。
+        retry_after = max(0, int(math.ceil(d.retry_after)))
+        details = {
+            "caller": d.caller,
+            "version": d.version,
+            "limit": d.limit,
+            "remaining": d.remaining,
+            "window_seconds": d.window_seconds,
+            "retry_after_seconds": round(d.retry_after, 3),
+        }
+        return _respond(
+            429,
+            ErrorCode.RATE_LIMITED,
+            f"调用方 {d.caller} 在版本 {d.version} 上超出配额",
+            details=details,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    @app.exception_handler(UnknownVersionPolicyError)
+    async def _unknown_version_policy(request: Request, exc: UnknownVersionPolicyError):
+        return _respond(
+            400,
+            ErrorCode.VERSION_UNKNOWN,
+            f"版本 {exc.version} 未配置配额策略",
+        )
 
     @app.exception_handler(RateLimitExceeded)
     async def _rate_limited(request: Request, exc: RateLimitExceeded):

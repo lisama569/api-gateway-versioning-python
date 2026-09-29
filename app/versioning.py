@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, replace
 
 
 class VersionStatus(enum.Enum):
@@ -45,10 +46,29 @@ class VersionRegistry:
     def __init__(self, versions: dict[str, VersionInfo], default: str) -> None:
         self._versions = dict(versions)
         self._default = default
+        self._lock = threading.RLock()
 
     @property
     def default(self) -> str:
         return self._default
+
+    def get(self, name: str) -> VersionInfo | None:
+        with self._lock:
+            return self._versions.get(name)
+
+    def set_status(self, name: str, status: VersionStatus) -> VersionInfo:
+        """运行时切换版本状态（active/deprecated/disabled）。
+
+        从下一个请求起生效；版本协商本身无状态，并发请求要么按旧状态
+        要么按新状态判定，不会出现中间态。
+        """
+        with self._lock:
+            info = self._versions.get(name)
+            if info is None:
+                raise UnknownVersionError(name)
+            updated = replace(info, status=status)
+            self._versions[name] = updated
+            return updated
 
     def negotiate(self, requested: str | None) -> NegotiatedVersion:
         """协商请求版本。

@@ -82,8 +82,48 @@ def test_stale_buckets_cleaned_up():
     _log("rl-cleanup", "old 空闲 100s > 2*window", f"buckets={limiter.bucket_count()}")
 
 
-def test_quota_not_shared_across_versions(client):
-    headers = {"X-Caller-ID": "rl-ver", "X-API-Version": "v2"}
-    codes = [client.get("/api/items", headers=headers).status_code for _ in range(6)]
-    assert codes == [200] * 5 + [429], "额度按调用方计，与版本无关且不重复计数"
-    _log("rl-ver", "同一 caller 跨版本请求共享同一额度", codes)
+def test_quota_isolated_across_versions_and_callers(client):
+    # v2 额度 2：同一调用方在 v2 上打满后立即被拒
+    headers_v2 = {"X-Caller-ID": "rl-ver", "X-API-Version": "v2"}
+    codes_v2 = [client.get("/api/items", headers=headers_v2).status_code for _ in range(4)]
+    assert codes_v2 == [200, 200, 429, 429], "v2 窗口额度为 2"
+    # 换到 v3（额度 5）仍可正常调用，额度互不挤占
+    codes_v3 = [
+        client.get(
+            "/api/items",
+            headers={"X-Caller-ID": "rl-ver", "X-API-Version": "v3"},
+        ).status_code
+        for _ in range(6)
+    ]
+    assert codes_v3 == [200] * 5 + [429], "v3 有独立额度，不被 v2 的用量挤占"
+    # 另一调用方在 v2 上也不受 rl-ver 影响
+    r = client.get(
+        "/api/items",
+        headers={"X-Caller-ID": "rl-ver-other", "X-API-Version": "v2"},
+    )
+    assert r.status_code == 200
+    _log(
+        "rl-ver",
+        "rl-ver 打满 v2 后 v3 仍有 5 个额度；其它调用方 v2 独立",
+        {"v2": codes_v2, "v3": codes_v3, "other": r.status_code},
+    )
+
+
+def test_undeclared_version_uses_default_version_quota(client):
+    # 未声明版本按默认版本 v3 的额度（5）计算，与显式 v3 请求共享同一桶
+    codes = [
+        client.get("/api/items", headers={"X-Caller-ID": "rl-default"}).status_code
+        for _ in range(3)
+    ]
+    assert codes == [200] * 3
+    for _ in range(2):
+        r = client.get(
+            "/api/items",
+            headers={"X-Caller-ID": "rl-default", "X-API-Version": "v3"},
+        )
+        assert r.status_code == 200
+    r = client.get("/api/items", headers={"X-Caller-ID": "rl-default"})
+    assert r.status_code == 429, "未声明版本走默认版本策略，额度与显式 v3 合并计算"
+    err = r.json()["error"]
+    assert err["details"]["version"] == "v3"
+    _log(err["request_id"], "未声明版本按默认 v3 配额判定", err["details"])
