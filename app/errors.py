@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.middleware import get_request_id
+from app.middleware import REQUEST_ID_HEADER, get_request_id
 from app.quotas import QuotaExceeded, UnknownVersionPolicyError
 from app.ratelimit import RateLimitExceeded
 from app.versioning import DisabledVersionError, UnknownVersionError
@@ -131,5 +131,15 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
-        logger.exception("request_id=%s unhandled_exception", get_request_id())
-        return _respond(500, ErrorCode.INTERNAL_ERROR, "服务内部错误")
+        request_id = get_request_id()
+        logger.exception("request_id=%s unhandled_exception", request_id)
+        # 兜底处理器位于 ServerErrorMiddleware（最外层异常中间件），
+        # 链路标识中间件包在其外时 contextvar 仍有效；响应头同样回写，
+        # 保证 500 路径与其它错误路径的标识行为一致。
+        return JSONResponse(
+            status_code=500,
+            content=error_body(
+                ErrorCode.INTERNAL_ERROR, "服务内部错误", request_id
+            ),
+            headers={REQUEST_ID_HEADER: request_id},
+        )

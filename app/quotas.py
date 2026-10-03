@@ -70,11 +70,13 @@ class _Bucket:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-def _validate(policy: QuotaPolicy) -> None:
+def validate_policy(policy: QuotaPolicy) -> None:
     if policy.limit <= 0:
         raise ValueError("limit must be positive")
     if policy.window_seconds <= 0:
         raise ValueError("window_seconds must be positive")
+    if policy.window_seconds != policy.window_seconds:  # NaN 防护
+        raise ValueError("window_seconds must be a finite positive number")
 
 
 class VersionQuotaManager:
@@ -94,7 +96,7 @@ class VersionQuotaManager:
 
     def __init__(self, policies: dict[str, QuotaPolicy]) -> None:
         for policy in policies.values():
-            _validate(policy)
+            validate_policy(policy)
         self._policies: dict[str, QuotaPolicy] = dict(policies)
         self._buckets: dict[tuple[str, str], _Bucket] = {}
         self._lock = threading.RLock()
@@ -150,7 +152,7 @@ class VersionQuotaManager:
 
     def update_policy(self, version: str, policy: QuotaPolicy) -> None:
         """运行时替换某版本的额度/窗口，下个请求起生效；已用计数保留。"""
-        _validate(policy)
+        validate_policy(policy)
         with self._lock:
             self._policies[version] = policy
 
@@ -158,6 +160,18 @@ class VersionQuotaManager:
         """删除版本策略并立即回收该版本的全部调用方桶。"""
         with self._lock:
             self._policies.pop(version, None)
+            stale_keys = [key for key in self._buckets if key[0] == version]
+            for key in stale_keys:
+                del self._buckets[key]
+
+    def clear_usage(self, version: str) -> None:
+        """立即回收某版本的全部调用方桶，但保留该版本当前策略。
+
+        用于版本停用语义：停用即彻底释放该版本占用的全部额度、清空累计
+        调用方统计，使重新启用后从干净状态开始。策略本身不动，停用期间
+        仍可单独调整额度/窗口，启用后直接生效。
+        """
+        with self._lock:
             stale_keys = [key for key in self._buckets if key[0] == version]
             for key in stale_keys:
                 del self._buckets[key]

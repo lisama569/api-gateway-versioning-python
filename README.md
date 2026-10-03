@@ -37,18 +37,32 @@
 
 ## 运行时策略调整（无需重启）
 
-- `PATCH /admin/versions/{name}`，请求体字段均可选：
-  - `limit`：新窗口额度；`window_seconds`：新窗口长度；
+- `PATCH /admin/versions/{name}`，请求体字段均可选，**但至少要提供一个**：
+  - `limit`：新窗口额度，必须为正整数（`> 0`）；
+  - `window_seconds`：新窗口长度，必须为正数（`> 0`）；
   - `status`：`active` / `deprecated` / `disabled`。
-- 从**下一个请求**起按新策略判定，调整前后的请求合并计算也不会出错：
+- **参数校验与失败语义**：
+  - `limit` / `window_seconds` 传 `0`、负数、非数字，`status` 传枚举外的值，
+    请求体为空对象、字段名写错（未识别字段）、`null` 或根本不是合法 JSON，
+    一律返回 **HTTP 422 + `VALIDATION_FAILED`**（属于调用方参数错误，
+    不会走到 500，也不回传任何内部异常文本/堆栈）；
+  - **失败原子性**：所有参数校验与读取都发生在任何状态变更之前。
+    一次请求里同时要求停用又把额度写成非法值时，请求失败，但该版本的
+    状态、额度、窗口与已累计用量与未调用时完全一致，不会“报错却改了一半”。
+- 合法请求从**下一个请求**起按新策略判定，调整前后的请求合并计算也不会出错：
   - 改额度/窗口不清零任何桶：收紧额度时已用量保留（可能立即超限，不多放行），
     放宽时只补足差额（不漏放行）；窗口拉长/缩短都只在“新窗口完整走完”后才翻窗，
     不会因为换策略就把已用量当零；
   - 计数与窗口翻转在桶锁的同一临界区完成，且每个请求先抓取一份不可变策略快照再判定，
-    并发请求正打进来时调整，每个请求只按一套策略判定，不重扣、不漏扣；
-  - 停用版本时先切状态再换策略：切换瞬间之后的请求在版本协商阶段立即被 410 拒绝，
-    **不再占用任何额度**；重新启用后停用期间也没有任何额度被消耗。
-- 非法 `limit <= 0` / `window_seconds <= 0` 返回 422。
+    并发请求正打进来时调整，每个请求只按一套策略判定，不重扣、不漏扣。
+- **停用与重新启用的额度口径**：
+  - 版本一旦停用，从下一个请求起在版本协商阶段立即被 410 拒绝，
+    **彻底不再占用任何额度**：该版本全部调用方的累计用量与内存统计桶立即清空；
+  - 停用期间可以继续调整额度/窗口（只换策略、不产生任何桶）；
+  - 重新启用后**从干净状态开始计数**，停用前的旧用量不会带回来，
+    调用方不会因为历史用量一上来就被限流。
+  - 切换顺序保证：停用先切状态再换策略再清桶；启用先让策略就位、最后放开状态，
+    切换瞬间不会出现“带着旧状态/旧桶判定”的请求。
 
 ## 策略与用量可观测
 
@@ -118,8 +132,12 @@
 
 ```bash
 uv sync                 # 安装依赖
-uv run pytest -q        # 全部测试（版本协商 / 版本级配额隔离 / 运行时策略并发 / 异常映射）
-uv run pytest -q -s     # 查看单测日志中的请求标识、判定依据与恢复信息
+uv run pytest -q        # 全部测试；默认开启 INFO 实时日志，
+                        # 每个用例开始/结束都会打印业务域与通过情况，
+                        # 覆盖：版本协商 / 调用方限流 / 版本级配额（隔离·
+                        # 运行时策略·停用清理·并发不重不漏）/ 管理端调整
+                        # （非法值·空体·错字段·失败原子性·停用再启用）/
+                        # 异常映射（含 500 路径链路标识）
 uv run uvicorn main:app --reload   # 启动服务
 ```
 
@@ -139,10 +157,27 @@ curl -i -H 'X-Caller-ID: demo' -H 'X-API-Version: v2' localhost:8000/api/items
 curl -s -X PATCH localhost:8000/admin/versions/v3 \
   -H 'Content-Type: application/json' -d '{"limit":1}'
 
-# 运行时停用 v2：之后立即 410，且不占额度；再启用后历史用量仍在
+# 非法参数：422（不是 500），错误体与响应头都带本次请求标识
+curl -i -X PATCH localhost:8000/admin/versions/v3 \
+  -H 'Content-Type: application/json' -H 'X-Request-ID: my-trace-1' \
+  -d '{"limit":0}'
+# 空请求体 / 写错字段名同样 422，不会静默成功
+curl -s -o /dev/null -w '%{http_code}\n' -X PATCH localhost:8000/admin/versions/v3 \
+  -H 'Content-Type: application/json' -d '{}'
+curl -s -o /dev/null -w '%{http_code}\n' -X PATCH localhost:8000/admin/versions/v3 \
+  -H 'Content-Type: application/json' -d '{"limt":3}'
+# 同时停用 + 非法值：422，且 v3 仍是 active（失败不改任何状态）
+curl -s -X PATCH localhost:8000/admin/versions/v3 \
+  -H 'Content-Type: application/json' -d '{"status":"disabled","limit":-5}'
+curl -s localhost:8000/admin/versions/v3 | python -m json.tool
+
+# 运行时停用 v2：之后立即 410、用量被清空；再启用后从干净的 2 个额度开始
 curl -s -X PATCH localhost:8000/admin/versions/v2 \
   -H 'Content-Type: application/json' -d '{"status":"disabled"}'
-curl -i -H 'X-API-Version: v2' localhost:8000/api/items
+curl -s localhost:8000/admin/versions/v2 | python -m json.tool   # callers 为空
+curl -i -H 'X-API-Version: v2' localhost:8000/api/items          # 410
+curl -s -X PATCH localhost:8000/admin/versions/v2 \
+  -H 'Content-Type: application/json' -d '{"status":"deprecated"}'
 
 # 查看某版本当前策略与各调用方用量
 curl -s localhost:8000/admin/versions/v2 | python -m json.tool

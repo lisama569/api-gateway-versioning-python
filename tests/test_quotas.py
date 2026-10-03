@@ -116,6 +116,40 @@ def test_concurrent_decisions_exact_while_policy_changes():
     _log("q-race", "100 并发中收紧 50->30", f"allowed={allowed} used={used}")
 
 
+def test_concurrent_decisions_exact_while_window_changes():
+    # 运行时改窗口与并发判定交叠：只换窗口不换额度，全部 100 个请求在
+    # 同一时刻（now=0）判定，窗口翻转不发生——放行数必须恰好等于额度，
+    # 最终用量与放行数精确一致，不重扣也不漏扣。
+    m = VersionQuotaManager({"v3": QuotaPolicy(40, 60.0)})
+    results: list[bool] = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(100)
+
+    def hit(i):
+        barrier.wait()
+        if i == 0:
+            m.update_policy("v3", QuotaPolicy(40, 15.0))
+        d = m.check("c", "v3", now=0.0)
+        with results_lock:
+            results.append(d.allowed)
+
+    threads = [threading.Thread(target=hit, args=(i,)) for i in range(100)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    allowed = sum(results)
+    assert allowed == 40, f"只换窗口不换额度且未到翻窗时刻，应恰好放行 40，实际 {allowed}"
+    used = m.usage("v3", caller="c", now=0.0).callers["c"].used
+    assert used == allowed, f"最终用量 {used} 必须等于放行数 {allowed}"
+    # 换窗口后恢复信息按新窗口给出（同一窗口起点 + 新窗口长度）
+    denied = m.check("c", "v3", now=0.0)
+    assert not denied.allowed and denied.window_seconds == 15.0
+    assert denied.reset_at == 15.0
+    _log("q-race-window", "100 并发中换窗口 60->15", f"allowed={allowed} used={used}")
+
+
 def test_recovery_info_matches_current_window():
     m = VersionQuotaManager({"v3": QuotaPolicy(2, 10.0)})
     m.check("c", "v3", now=0.0)
@@ -175,6 +209,46 @@ def test_remove_version_drops_its_buckets():
         m.check("c", "v2", now=1.0)
     assert m.check("c", "v3", now=1.0).allowed
     _log("q-remove", "删除 v2 策略同步回收其桶", m.bucket_count())
+
+
+def test_clear_usage_drops_buckets_but_keeps_policy():
+    m = VersionQuotaManager(
+        {"v2": QuotaPolicy(2, 10.0), "v3": QuotaPolicy(5, 10.0)}
+    )
+    for caller in ("a", "b"):
+        m.check(caller, "v2", now=0.0)
+    m.check("c", "v3", now=0.0)
+    assert m.bucket_count() == 3
+    # 停用语义：清空该版本全部调用方累计，其它版本桶不动
+    m.clear_usage("v2")
+    assert ("v2", "a") not in m._buckets
+    assert ("v2", "b") not in m._buckets
+    assert ("v3", "c") in m._buckets, "清理 v2 不得波及 v3 的桶"
+    # 策略保留：清空后仍可按原策略判定，且调用方从 0 开始（干净重启口径）
+    d = m.check("a", "v2", now=1.0)
+    assert d.allowed and d.limit == 2 and d.remaining == 1
+    # 清空一个本来没有桶的版本是安全的幂等操作
+    m.clear_usage("v9")
+    _log("q-clear", "clear_usage(v2) 只清用量保留策略，v3 不受影响", m.bucket_count())
+
+
+def test_disabled_window_accumulates_nothing_and_restart_is_fresh():
+    # 覆盖停用/重新启用的额度口径：打满 -> 清空 -> 干净桶 -> 再打满
+    m = VersionQuotaManager({"v2": QuotaPolicy(2, 60.0)})
+    assert [m.check("c", "v2", now=0.0).allowed for _ in range(3)] == [
+        True,
+        True,
+        False,
+    ]
+    m.clear_usage("v2")  # 停用
+    snap = m.usage("v2", caller="c", now=30.0)
+    assert "c" not in snap.callers, "停用后旧用量不保留"
+    assert m.bucket_count() == 0
+    # 停用期间可以换策略（不创建桶），启用后新策略 + 干净桶
+    m.update_policy("v2", QuotaPolicy(3, 60.0))
+    decisions = [m.check("c", "v2", now=31.0) for _ in range(4)]
+    assert [d.allowed for d in decisions] == [True, True, True, False]
+    _log("q-disable-cycle", "打满->停用清空->换额度->启用后全新 3 额度", "通过")
 
 
 def test_usage_snapshot_does_not_consume_quota():

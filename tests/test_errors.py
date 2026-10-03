@@ -83,3 +83,32 @@ def test_no_stacktrace_leak(client):
     for marker in ("Traceback", "File \"", "DependencyFailure("):
         assert marker not in text, f"响应中不得出现原始异常信息: {marker}"
     _log(r.json()["error"]["request_id"], "检查响应体无堆栈痕迹", "通过")
+
+
+def test_internal_error_keeps_real_request_id_and_no_detail(client, monkeypatch):
+    # 模拟一个完全未预期的内部异常（非任何已知业务异常）：
+    # 必须回 500，链路标识仍是本次请求的真实标识，而不是占位符 "-"，
+    # 且内部异常细节（如异常文本/堆栈）不得透出。
+    def _boom(*args, **kwargs):
+        raise RuntimeError("internal secret detail xyz")
+
+    monkeypatch.setattr("main.registry.negotiate", _boom)
+    r = client.get("/api/items", headers={"X-Request-ID": "rid-500-path"})
+    assert r.status_code == 500
+    err = r.json()["error"]
+    assert err["code"] == "INTERNAL_ERROR"
+    assert err["message"] == "服务内部错误"
+    assert err["request_id"] == "rid-500-path"
+    assert err["request_id"] != "-"
+    assert r.headers["X-Request-ID"] == "rid-500-path"
+    assert "internal secret detail" not in r.text
+    assert "RuntimeError" not in r.text and "Traceback" not in r.text
+    _log("rid-500-path", "未预期内部异常的兜底 500 路径", err["code"])
+
+    # 未传入 X-Request-ID 时也必须生成可用标识（非占位符）
+    monkeypatch.setattr("main.registry.negotiate", _boom)
+    r2 = client.get("/api/items")
+    rid = r2.json()["error"]["request_id"]
+    assert rid and rid != "-"
+    assert r2.headers["X-Request-ID"] == rid
+    _log(rid, "500 路径缺省标识时生成真实标识", "ok")
