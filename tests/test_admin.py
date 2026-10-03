@@ -51,22 +51,27 @@ def test_limit_change_does_not_forget_consumed_quota(client):
     _log(r.json()["error"]["request_id"], "收紧到 2 时已用 3 不清零", "429")
 
 
-def test_runtime_disable_rejects_immediately_without_consuming_quota(client):
-    h = {"X-Caller-ID": "adm-disable", "X-API-Version": "v2"}
+def test_runtime_disable_rejects_immediately_and_releases_quota(client):
+    h = {"X-Caller-ID": "adm-disable", "X-API-Version": "v2"}  # v2 额度 2/60s
     assert client.get("/api/items", headers=h).status_code == 200
+    assert client.get("/api/items", headers=h).status_code == 200
+    assert client.get("/api/items", headers=h).status_code == 429  # 已打满
     r = client.patch("/admin/versions/v2", json={"status": "disabled"})
     assert r.status_code == 200 and r.json()["status"] == "disabled"
     # 停用后立刻 410
     blocked = client.get("/api/items", headers=h)
     assert blocked.status_code == 410
     assert blocked.json()["error"]["code"] == "VERSION_DISABLED"
-    # 重新启用：停用期间没有任何请求占用 v2 额度，仍剩 1 个（之前已用 1）
+    # 停用即彻底释放额度：管理端已看不到任何调用方统计
+    view = client.get("/admin/versions/v2").json()
+    assert view["callers"] == []
+    # 重新启用后从干净状态开始：旧用量不再占用额度，重新计满 2 次才被限流
     client.patch("/admin/versions/v2", json={"status": "deprecated"})
-    ok = client.get("/api/items", headers=h)
-    assert ok.status_code == 200
+    assert client.get("/api/items", headers=h).status_code == 200
+    assert client.get("/api/items", headers=h).status_code == 200
     again = client.get("/api/items", headers=h)
-    assert again.status_code == 429, "v2 额度 2：恢复前 1 + 恢复后 1，第 3 次拒绝"
-    _log(blocked.json()["error"]["request_id"], "运行时停用 v2 即时生效", "410->200->429")
+    assert again.status_code == 429, "重新启用后重新计满 2 次，第 3 次才拒绝"
+    _log(blocked.json()["error"]["request_id"], "停用 v2 即时生效并释放额度", "410->启用后重新计满->429")
 
 
 def test_runtime_window_change_recovery_reflects_new_window(client):
@@ -112,6 +117,55 @@ def test_admin_get_reports_policy_and_per_caller_usage(client):
     # 未知版本走 VERSION_UNKNOWN
     assert client.get("/admin/versions/v9").status_code == 400
     _log("admin-view", "管理端可见 v2 策略与 adm-view 用量", entry)
+
+
+def test_invalid_limit_or_window_rejected_as_validation_failed(client):
+    for body in ({"limit": 0}, {"limit": -3}, {"window_seconds": 0}, {"window_seconds": -1.5}):
+        r = client.patch("/admin/versions/v3", json=body)
+        assert r.status_code == 422, body
+        err = r.json()["error"]
+        assert err["code"] == "VALIDATION_FAILED"
+        # 链路标识与其它错误路径一致：不是占位符，且与响应头一致
+        assert err["request_id"] and err["request_id"] != "-"
+        assert r.headers["X-Request-ID"] == err["request_id"]
+        # 不透出内部校验细节
+        assert "must be positive" not in r.text and "ValueError" not in r.text
+        # 策略未被改动
+        assert client.get("/admin/versions/v3").json()["policy"] == {
+            "limit": 5, "window_seconds": 60.0,
+        }
+        _log(err["request_id"], f"非法策略参数 {body}", "422 VALIDATION_FAILED")
+
+
+def test_empty_body_and_unknown_field_rejected(client):
+    for body in ({}, {"limt": 3}, {"statuss": "disabled"}):
+        r = client.patch("/admin/versions/v3", json=body)
+        assert r.status_code == 422, body
+        assert r.json()["error"]["code"] == "VALIDATION_FAILED"
+    # 状态与策略均未变
+    view = client.get("/admin/versions/v3").json()
+    assert view["status"] == "active"
+    assert view["policy"] == {"limit": 5, "window_seconds": 60.0}
+    _log("admin-empty", "空请求体/错字段名", "422 VALIDATION_FAILED")
+
+
+def test_failed_update_leaves_status_policy_and_quota_untouched(client):
+    h = {"X-Caller-ID": "adm-atomic", "X-API-Version": "v2"}  # v2 额度 2/60s
+    assert client.get("/api/items", headers=h).status_code == 200  # 已用 1
+    before = client.get("/admin/versions/v2").json()
+    # 一次请求既想停用、又填了非法额度：整体失败，任何状态都不得改变
+    r = client.patch("/admin/versions/v2", json={"status": "disabled", "limit": 0})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "VALIDATION_FAILED"
+    after = client.get("/admin/versions/v2").json()
+    assert after["status"] == before["status"] == "deprecated", "失败不得把版本停用"
+    assert after["policy"] == before["policy"]
+    entry = next(c for c in after["callers"] if c["caller"] == "adm-atomic")
+    assert entry["used"] == 1, "失败不得改动已统计用量"
+    # 版本仍在正常服务，额度口径与失败前一致（剩 1 个）
+    assert client.get("/api/items", headers=h).status_code == 200
+    assert client.get("/api/items", headers=h).status_code == 429
+    _log(r.json()["error"]["request_id"], "停用+非法额度整体失败", "状态/策略/用量均未变")
 
 
 def test_runtime_policy_change_under_concurrent_requests(client):

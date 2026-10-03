@@ -14,3 +14,10 @@ default = true
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+# 单测日志直接输出到终端：能看到每条用例覆盖的业务域与通过情况，
+# 以及请求标识、判定依据、恢复信息等业务日志。
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(levelname)s %(name)s %(message)s"

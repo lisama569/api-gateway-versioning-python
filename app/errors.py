@@ -4,12 +4,13 @@ from __future__ import annotations
 import enum
 import logging
 import math
+import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from app.middleware import get_request_id
+from app.middleware import REQUEST_ID_HEADER, get_request_id
 from app.quotas import QuotaExceeded, UnknownVersionPolicyError
 from app.ratelimit import RateLimitExceeded
 from app.versioning import DisabledVersionError, UnknownVersionError
@@ -131,5 +132,16 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
-        logger.exception("request_id=%s unhandled_exception", get_request_id())
-        return _respond(500, ErrorCode.INTERNAL_ERROR, "服务内部错误")
+        # 兜底处理器运行在最外层中间件，读不到请求链路中间件写入的
+        # contextvar；此时从请求头取回调用方传入的标识，缺省则新生成，
+        # 并回写到响应头，保证 500 路径的链路标识与其它错误路径一致可用。
+        request_id = get_request_id()
+        if request_id == "-":
+            incoming = request.headers.get(REQUEST_ID_HEADER)
+            request_id = incoming.strip() if incoming and incoming.strip() else uuid.uuid4().hex
+        logger.exception("request_id=%s unhandled_exception", request_id)
+        return JSONResponse(
+            status_code=500,
+            content=error_body(ErrorCode.INTERNAL_ERROR, "服务内部错误", request_id),
+            headers={REQUEST_ID_HEADER: request_id},
+        )

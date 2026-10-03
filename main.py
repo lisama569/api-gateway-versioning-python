@@ -3,7 +3,7 @@ import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.errors import (
     BusinessRuleViolation,
@@ -56,9 +56,24 @@ DEPRECATION_HEADER = "X-API-Deprecated"
 
 
 class VersionPolicyUpdate(BaseModel):
-    limit: int | None = None
-    window_seconds: float | None = None
+    """运行时策略调整请求体。
+
+    校验全部在解析阶段完成（limit/window_seconds 必须为正、拒绝未知字段、
+    至少填一个字段），校验失败直接 422，处理器不会被执行，因此版本状态、
+    额度、窗口绝不会被改一半。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int | None = Field(default=None, gt=0)
+    window_seconds: float | None = Field(default=None, gt=0)
     status: VersionStatus | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> "VersionPolicyUpdate":
+        if not self.model_fields_set:
+            raise ValueError("至少需要一个待调整字段: limit / window_seconds / status")
+        return self
 
 
 def _version_admin_view(name: str) -> dict:
@@ -164,9 +179,12 @@ def update_version_policy(name: str, update: VersionPolicyUpdate):
 
     if update.status is VersionStatus.DISABLED:
         # 先关版本再换策略：切换瞬间之后的请求在协商阶段即被 410 拒绝，
-        # 不会有请求带着新策略进入配额判定。
+        # 不会有请求带着新策略进入配额判定。停用即彻底释放该版本占用的
+        # 额度：清空全部调用方桶，历史统计不再滞留内存，重新启用后从
+        # 干净状态重新计数。
         registry.set_status(name, VersionStatus.DISABLED)
         quota_manager.update_policy(name, new_policy)
+        quota_manager.clear_usage(name)
     else:
         # 重新启用或仅改额度：策略先就位，状态最后放开。
         quota_manager.update_policy(name, new_policy)

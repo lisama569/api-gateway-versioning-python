@@ -154,6 +154,17 @@ class VersionQuotaManager:
         with self._lock:
             self._policies[version] = policy
 
+    def clear_usage(self, version: str) -> None:
+        """清空某版本的全部调用方桶，但保留其策略。
+
+        用于版本停用：停用即彻底释放该版本占用的额度，历史调用方统计
+        不再滞留内存；重新启用后所有调用方从干净状态重新计数。
+        """
+        with self._lock:
+            stale_keys = [key for key in self._buckets if key[0] == version]
+            for key in stale_keys:
+                del self._buckets[key]
+
     def remove_version(self, version: str) -> None:
         """删除版本策略并立即回收该版本的全部调用方桶。"""
         with self._lock:

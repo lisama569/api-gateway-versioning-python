@@ -83,3 +83,24 @@ def test_no_stacktrace_leak(client):
     for marker in ("Traceback", "File \"", "DependencyFailure("):
         assert marker not in text, f"响应中不得出现原始异常信息: {marker}"
     _log(r.json()["error"]["request_id"], "检查响应体无堆栈痕迹", "通过")
+
+
+def test_internal_error_keeps_request_id(client):
+    from main import app
+
+    @app.get("/_boom")
+    def _boom():
+        raise RuntimeError("unexpected")
+
+    # 兜底 500 处理器跑在最外层中间件，也必须给出可用的链路标识
+    r = client.get("/_boom", headers={"X-Request-ID": "err-req-500"})
+    assert r.status_code == 500
+    err = _assert_error_shape(r.json(), "INTERNAL_ERROR")
+    assert err["request_id"] == "err-req-500"
+    assert r.headers["X-Request-ID"] == "err-req-500"
+    # 未传标识时新生成，同样回写响应头，绝不再是占位符
+    r2 = client.get("/_boom")
+    err2 = _assert_error_shape(r2.json(), "INTERNAL_ERROR")
+    assert r2.headers["X-Request-ID"] == err2["request_id"]
+    assert "RuntimeError" not in r2.text and "unexpected" not in r2.text
+    _log(err["request_id"], "未预期异常走兜底 500 映射", "链路标识正常、细节不透出")
